@@ -29,6 +29,7 @@ int_to_binary_vector <- function(x, n) {
 #' @return A fitted model object.
 #' @export
 run_model <- function(form, data, family = "gaussian", ...) {
+	family <- match.arg(family, c("gaussian", "cox", "binomial"))
 	args <- list(form, data = data, ...)
 	if (family == "gaussian") {
 		args$model <- FALSE
@@ -66,37 +67,42 @@ run_model <- function(form, data, family = "gaussian", ...) {
 conductVibrationForK <- function(base_formula, dataFrame, adjustby, k = 1,
                                   family = c("gaussian", "binomial", "cox"),
                                   print_progress = TRUE, ...) {
+	family <- match.arg(family)
+	dots <- list(...)
+	if (family == "gaussian") {
+		qr_context <- prepare_gaussian_qr_context(base_formula, dataFrame, adjustby, dots)
+		if (isTRUE(qr_context$supported)) {
+			return(conductVibrationForK_gaussian_qr_prepared(qr_context, k, print_progress))
+		}
+		if (print_progress) {
+			message(sprintf("Falling back to per-model lm fits: %s", qr_context$reason))
+		}
+	}
+	conductVibrationForK_classic(base_formula, dataFrame, adjustby, k, family, print_progress, ...)
+}
+
+conductVibrationForK_classic <- function(base_formula, dataFrame, adjustby, k = 1,
+										 family = c("gaussian", "binomial", "cox"),
+										 print_progress = TRUE, ...) {
 	initFrame <- function(nrows, ncols) {
 		matrix(NA, nrows, ncols)
-	}
-
-	addToBase <- function(base_formula, adjustingVariables) {
-		form <- base_formula
-		if (length(adjustingVariables)) {
-			addStr <- stats::as.formula(sprintf("~ . + %s", paste(adjustingVariables, collapse = "+")))
-			form <- stats::update.formula(base_formula, addStr)
-		}
-		return(form)
 	}
 
 	variablename <- attr(stats::terms(base_formula), "term.labels")[1]
 	varname <- all.vars(stats::as.formula(sprintf("~%s", variablename)))
 	if (print_progress) print(varname)
 
-	if (inherits(adjustby, "formula")) {
-		adjustby <- attr(stats::terms(adjustby), "term.labels")
-	}
+	adjustby <- adjustment_terms(adjustby)
 	n <- length(adjustby)
-	varComb <- utils::combn(n, k)
+	varComb <- combination_matrix(n, k)
 	retFrame <- NULL
 	retFrameCounter <- 1
 	bicFrame <- NULL
-	for (ii in 1:ncol(varComb)) {
+	for (ii in seq_len(ncol(varComb))) {
 		if (print_progress) cat(sprintf("%i/%i\n", ii, ncol(varComb)))
 
-		adjustingVariables <- adjustby[varComb[, ii]]
-		strComb <- paste(sort(varComb[, ii]), collapse = ",")
-		form <- addToBase(base_formula, adjustingVariables)
+		adjustingVariables <- if (k == 0L) character(0) else adjustby[varComb[, ii]]
+		form <- add_adjustors_to_formula(base_formula, adjustingVariables)
 		if (print_progress) print(form)
 
 		est <- tryCatch(
@@ -144,7 +150,8 @@ conductVibrationForK <- function(base_formula, dataFrame, adjustby, k = 1,
 #' @return Numeric vector with effective degrees of freedom and BIC.
 #' @keywords internal
 getBIC <- function(mod) {
-	return(stats::extractAIC(mod, k = log(mod$nevent)))
+	nobs_val <- if (!is.null(mod$nevent)) mod$nevent else stats::nobs(mod)
+	stats::extractAIC(mod, k = log(nobs_val))
 }
 
 #' Recompute p-values from z-statistics
@@ -175,7 +182,7 @@ recomputePvalue <- function(allData, zStatColName, pValColName) {
 #'   variables.
 #' @param family One of `"gaussian"`, `"binomial"`, or `"cox"`.
 #' @param kMin Minimum number of adjustors (default 1).
-#' @param kMax Maximum number of adjustors (default `length(adjustby) - 1`).
+#' @param kMax Maximum number of adjustors (default `length(adjustby)`).
 #' @param print_progress Logical; print progress to console.
 #' @param ... Additional arguments passed to [run_model()].
 #' @return A list with components `vibFrame`, `bicFrame`, `combinations`,
@@ -185,14 +192,31 @@ conductVibration <- function(base_formula, dataFrame, adjustby,
                               family = c("gaussian", "binomial", "cox"),
                               kMin = NULL, kMax = NULL,
                               print_progress = TRUE, ...) {
+	family <- match.arg(family)
+	adjust_terms <- adjustment_terms(adjustby)
 	if (is.null(kMin)) {
 		kMin <- 1
 	}
 	if (is.null(kMax)) {
-		n <- length(attr(stats::terms(adjustby), "term.labels"))
-		kMax <- n - 1
+		kMax <- length(adjust_terms)
+	}
+	if (kMin > kMax) {
+		stop("kMin must be less than or equal to kMax.", call. = FALSE)
 	}
 	cat(sprintf("running models; k start:%i, k stop:%i\n", kMin, kMax))
+	if (family == "gaussian") {
+		qr_context <- prepare_gaussian_qr_context(base_formula, dataFrame, adjustby, list(...))
+		if (isTRUE(qr_context$supported)) {
+			retFrame <- lapply(kMin:kMax, function(k) {
+				conductVibrationForK_gaussian_qr_prepared(qr_context, k, print_progress)
+			})
+			retFrame <- Filter(Negate(is.null), retFrame)
+			return(gatherFrames(retFrame))
+		}
+		if (print_progress) {
+			message(sprintf("Falling back to per-model lm fits: %s", qr_context$reason))
+		}
+	}
 	retFrame <- list()
 	ii <- 1
 	for (k in kMin:kMax) {
@@ -227,9 +251,7 @@ conductVibrationSample <- function(base_formula, dataFrame, adjustby,
 	family <- match.arg(family)
 
 	adjustby_original <- adjustby
-	if (inherits(adjustby, "formula")) {
-		adjustby <- attr(stats::terms(adjustby), "term.labels")
-	}
+	adjustby <- adjustment_terms(adjustby)
 	n_adj <- length(adjustby)
 
 	total_combos <- 2^n_adj - 1
@@ -389,7 +411,7 @@ gatherVibrationBIC <- function(returnFrames) {
 #' @param family Model family.
 #' @return Character vector of standardized column names.
 #' @keywords internal
-column_headers <- function(vibFrame, family) {
+	column_headers <- function(vibFrame, family) {
 	existingColnames <- colnames(vibFrame)
 	if (family == "cox") {
 		isRobust <- grep("robust", existingColnames)
@@ -399,12 +421,16 @@ column_headers <- function(vibFrame, family) {
 			return(c("estimate", "HR", "se", "z", "pvalue", "combination_index", "factor_level", "k"))
 		}
 	} else if (family == "gaussian") {
-		existingColnames[1] <- "estimate"
-		existingColnames[length(existingColnames) - 4] <- "pvalue"
+		existingColnames <- sub("^Estimate$", "estimate", existingColnames)
+		existingColnames <- sub("^Std\\. Error$", "se", existingColnames)
+		existingColnames <- sub("^t value$", "z", existingColnames)
+		existingColnames <- sub("^Pr\\(>\\|t\\|\\)$", "pvalue", existingColnames)
 		return(existingColnames)
 	} else if (family == "binomial") {
-		existingColnames[1] <- "estimate"
-		existingColnames[length(existingColnames) - 4] <- "pvalue"
+		existingColnames <- sub("^Estimate$", "estimate", existingColnames)
+		existingColnames <- sub("^Std\\. Error$", "se", existingColnames)
+		existingColnames <- sub("^z value$", "z", existingColnames)
+		existingColnames <- sub("^Pr\\(>\\|z\\|\\)$", "pvalue", existingColnames)
 		return(existingColnames)
 	}
 	return(existingColnames)

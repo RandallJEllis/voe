@@ -27,7 +27,7 @@ variables.}
 
 \item{kMin}{Minimum number of adjustors (default 1).}
 
-\item{kMax}{Maximum number of adjustors (default \code{length(adjustby) - 1}).}
+\item{kMax}{Maximum number of adjustors (default \code{length(adjustby)}).}
 
 \item{print_progress}{Logical; print progress to console.}
 
