@@ -100,21 +100,28 @@ prepare_gaussian_qr_context <- function(base_formula, dataFrame, adjustby,
 	}
 
 	y <- stats::model.response(full_mf)
-	if (!is.numeric(y) || !is.null(dim(y))) {
+	is_multi_outcome <- is.matrix(y) && is.numeric(y)
+	if (!is.numeric(y) || (is_multi_outcome && is.null(ncol(y)))) {
 		return(list(
 			supported = FALSE,
-			reason = "QR backend currently supports a numeric response vector only."
+			reason = "QR backend currently supports numeric gaussian responses only."
 		))
 	}
 
 	offset <- stats::model.offset(full_mf)
+	if (is_multi_outcome && !is.null(offset)) {
+		return(list(
+			supported = FALSE,
+			reason = "QR backend does not support offsets with multivariate gaussian responses."
+		))
+	}
 	if (is.null(offset)) {
-		offset <- rep(0, length(y))
+		offset <- rep(0, if (is_multi_outcome) nrow(y) else length(y))
 	}
 
 	weights <- stats::model.weights(full_mf)
 	if (is.null(weights)) {
-		weights <- rep(1, length(y))
+		weights <- rep(1, if (is_multi_outcome) nrow(y) else length(y))
 	}
 	if (!is.numeric(weights) || any(weights < 0)) {
 		return(list(
@@ -135,7 +142,17 @@ prepare_gaussian_qr_context <- function(base_formula, dataFrame, adjustby,
 
 	sqrt_weights <- sqrt(weights)
 	X_weighted <- X * sqrt_weights
-	y_weighted <- (y - offset) * sqrt_weights
+	if (is_multi_outcome) {
+		Y_weighted <- sweep(y, 1L, offset, "-", check.margin = FALSE)
+		Y_weighted <- sweep(Y_weighted, 1L, sqrt_weights, "*", check.margin = FALSE)
+		outcome_names <- colnames(y)
+		if (is.null(outcome_names)) {
+			outcome_names <- paste0("outcome_", seq_len(ncol(y)))
+		}
+	} else {
+		y_weighted <- (y - offset) * sqrt_weights
+		outcome_names <- NULL
+	}
 
 	if (qr(X_weighted)$rank < ncol(X_weighted)) {
 		return(list(
@@ -181,7 +198,10 @@ prepare_gaussian_qr_context <- function(base_formula, dataFrame, adjustby,
 		adjust = adjust_terms,
 		base_formula = base_formula,
 		n_obs = nrow(X_weighted),
-		y_weighted = as.numeric(y_weighted),
+		is_multi_outcome = is_multi_outcome,
+		y_weighted = if (is_multi_outcome) NULL else as.numeric(y_weighted),
+		Y_weighted = if (is_multi_outcome) Y_weighted else NULL,
+		outcome_names = outcome_names,
 		X_weighted = X_weighted,
 		fixed_col_indices = fixed_col_indices,
 		fixed_coef_names = colnames(X)[fixed_col_indices],
@@ -370,13 +390,46 @@ qr_new_outcome <- function(state, y) {
 	)
 }
 
+qr_batch_outcomes <- function(state, Y) {
+	p <- state$p
+	q <- ncol(Y)
+	m <- state$m
+	if (p == 0L) {
+		return(list(
+			beta = matrix(0, 0L, q),
+			fitted = matrix(0, m, q),
+			residuals = Y,
+			rss = colSums(Y^2)
+		))
+	}
+
+	QtY <- crossprod(state$Q, Y)
+	beta <- backsolve(state$R, QtY)
+	fitted <- state$Q %*% QtY
+	residuals <- Y - fitted
+
+	list(
+		beta = beta,
+		fitted = fitted,
+		residuals = residuals,
+		rss = colSums(residuals^2)
+	)
+}
+
 compute_se <- function(R, sigma) {
 	p <- nrow(R)
 	if (p == 0L) {
-		return(numeric(0L))
+		if (length(sigma) == 1L) {
+			return(numeric(0L))
+		}
+		return(matrix(0, 0L, length(sigma)))
 	}
 	R_inv <- backsolve(R, diag(p))
-	sqrt(rowSums(R_inv^2)) * sigma
+	col_sd <- sqrt(rowSums(R_inv^2))
+	if (length(sigma) == 1L) {
+		return(col_sd * sigma)
+	}
+	outer(col_sd, sigma)
 }
 
 update_gaussian_qr_state <- function(context, state, coef_names,
@@ -440,6 +493,49 @@ fit_gaussian_qr_model <- function(context, state, coef_names) {
 	)
 }
 
+fit_gaussian_qr_model_multi <- function(context, state, coef_names) {
+	batch <- qr_batch_outcomes(state, context$Y_weighted)
+	n_params <- state$p
+	df_res <- context$n_obs - n_params
+	n_outcomes <- ncol(context$Y_weighted)
+
+	se <- matrix(NA_real_, nrow = n_params, ncol = n_outcomes)
+	t_stat <- matrix(NA_real_, nrow = n_params, ncol = n_outcomes)
+	pvalue <- matrix(NA_real_, nrow = n_params, ncol = n_outcomes)
+	if (n_params > 0L && df_res > 0L) {
+		sigma <- sqrt(batch$rss / df_res)
+		se <- compute_se(state$R, sigma)
+		t_stat <- batch$beta / se
+		pvalue <- 2 * stats::pt(-abs(t_stat), df = df_res)
+	}
+
+	coef_tables <- lapply(seq_len(n_outcomes), function(ii) {
+		coef_table <- cbind(
+			"Estimate" = batch$beta[, ii],
+			"Std. Error" = se[, ii],
+			"t value" = t_stat[, ii],
+			"Pr(>|t|)" = pvalue[, ii]
+		)
+		rownames(coef_table) <- coef_names
+		coef_table
+	})
+	names(coef_tables) <- context$outcome_names
+
+	bic_frame <- data.frame(
+		edf = rep(n_params, n_outcomes),
+		bic = vapply(batch$rss, function(rss) {
+			unname(gaussian_bic_from_qr(rss, context$n_obs, n_params)["bic"])
+		}, numeric(1L)),
+		outcome = context$outcome_names,
+		stringsAsFactors = FALSE
+	)
+
+	list(
+		coef_tables = coef_tables,
+		bic_frame = bic_frame
+	)
+}
+
 assemble_fixed_k_result <- function(model_results, coef_colnames, k, varComb,
 										 family, base_formula, adjust_terms) {
 	total_rows <- sum(vapply(model_results, function(x) x$n_levels, integer(1)))
@@ -475,8 +571,24 @@ assemble_fixed_k_result <- function(model_results, coef_colnames, k, varComb,
 	)
 }
 
+assemble_fixed_k_result_multi <- function(vib_rows, bic_rows, k, varComb,
+											  family, base_formula, adjust_terms) {
+	list(
+		vibration = do.call(rbind, vib_rows),
+		bic = do.call(rbind, bic_rows),
+		k = k,
+		combinations = varComb,
+		family = family,
+		base_formula = base_formula,
+		adjust = adjust_terms
+	)
+}
+
 conductVibrationForK_gaussian_qr_prepared <- function(context, k,
 													  print_progress = TRUE) {
+	if (isTRUE(context$is_multi_outcome)) {
+		return(conductVibrationForK_gaussian_qr_multi_prepared(context, k, print_progress))
+	}
 	n_adjust <- length(context$adjust_groups)
 	varComb <- combination_matrix(n_adjust, k)
 	n_models <- ncol(varComb)
@@ -535,6 +647,83 @@ conductVibrationForK_gaussian_qr_prepared <- function(context, k,
 	assemble_fixed_k_result(
 		model_results = model_results,
 		coef_colnames = coef_colnames,
+		k = k,
+		varComb = varComb,
+		family = "gaussian",
+		base_formula = context$base_formula,
+		adjust_terms = context$adjust
+	)
+}
+
+conductVibrationForK_gaussian_qr_multi_prepared <- function(context, k,
+															print_progress = TRUE) {
+	n_adjust <- length(context$adjust_groups)
+	varComb <- combination_matrix(n_adjust, k)
+	n_models <- ncol(varComb)
+
+	if (print_progress) {
+		cat(sprintf(
+			"using QR backend for gaussian models; %i combinations at k=%i across %i outcomes\n",
+			n_models, k, length(context$outcome_names)
+		))
+	}
+
+	previous_terms <- integer(0)
+	state <- qr_state_from_cols(context$X_weighted, context$fixed_col_indices)
+	coef_names <- context$fixed_coef_names
+	vib_rows <- list()
+	bic_rows <- list()
+
+	for (ii in seq_len(n_models)) {
+		current_terms <- if (k == 0L) integer(0) else varComb[, ii]
+		updated <- update_gaussian_qr_state(
+			context, state, coef_names, previous_terms, current_terms
+		)
+		state <- updated$state
+		coef_names <- updated$coef_names
+		previous_terms <- current_terms
+
+		if (print_progress && (ii == 1L || ii %% 100L == 0L || ii == n_models)) {
+			cat(sprintf("%i/%i\n", ii, n_models))
+		}
+
+		model_fit <- fit_gaussian_qr_model_multi(context, state, coef_names)
+		for (outcome_idx in seq_along(model_fit$coef_tables)) {
+			coef_table <- model_fit$coef_tables[[outcome_idx]]
+			rowIndex <- find_exposure_rows(
+				rownames(coef_table),
+				context$exposure_term,
+				context$exposure_vars
+			)
+			if (!length(rowIndex)) {
+				next
+			}
+
+			vib_rows[[length(vib_rows) + 1L]] <- data.frame(
+				coef_table[rowIndex, , drop = FALSE],
+				combination_index = ii,
+				factor_level = seq_along(rowIndex),
+				outcome = names(model_fit$coef_tables)[outcome_idx],
+				check.names = FALSE,
+				stringsAsFactors = FALSE
+			)
+
+			bic_rows[[length(bic_rows) + 1L]] <- data.frame(
+				model_fit$bic_frame[outcome_idx, , drop = FALSE],
+				combination_index = ii,
+				check.names = FALSE,
+				stringsAsFactors = FALSE
+			)
+		}
+	}
+
+	if (!length(vib_rows)) {
+		return(NULL)
+	}
+
+	assemble_fixed_k_result_multi(
+		vib_rows = vib_rows,
+		bic_rows = bic_rows,
 		k = k,
 		varComb = varComb,
 		family = "gaussian",

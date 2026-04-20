@@ -13,6 +13,21 @@ Patel CJ, Burford B, Ioannidis JPA. Assessment of vibration of effects due to mo
 devtools::install_github("chiragjp/voe")
 ```
 
+## Python Implementation
+
+A Python implementation now lives under `python/` in this repo.
+
+```bash
+cd python
+python3 -m pip install -e '.[dev]'
+python3 -m pytest
+```
+
+The Python package exposes `voe.conduct_vibration()` and
+`voe.conduct_vibration_for_k()` for Gaussian vibration-of-effects analyses,
+with the QR update/downdate machinery available in the bundled `regsens`
+core package.
+
 ## Example: Is serum cadmium associated with mortality?
 
 The association between serum cadmium and mortality depends heavily on which

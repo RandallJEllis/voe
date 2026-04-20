@@ -18,6 +18,14 @@ int_to_binary_vector <- function(x, n) {
 	as.integer(intToBits(x))[1:n]
 }
 
+is_multivariate_response_formula <- function(form) {
+	if (length(form) < 3L) {
+		return(FALSE)
+	}
+	lhs <- form[[2L]]
+	is.call(lhs) && identical(lhs[[1L]], as.name("cbind"))
+}
+
 #' Fit a model
 #'
 #' Dispatches to [lm()], [survival::coxph()], or [glm()] based on family.
@@ -73,6 +81,12 @@ conductVibrationForK <- function(base_formula, dataFrame, adjustby, k = 1,
 		qr_context <- prepare_gaussian_qr_context(base_formula, dataFrame, adjustby, dots)
 		if (isTRUE(qr_context$supported)) {
 			return(conductVibrationForK_gaussian_qr_prepared(qr_context, k, print_progress))
+		}
+		if (is_multivariate_response_formula(base_formula)) {
+			stop(
+				sprintf("Multivariate gaussian VoE requires the QR backend: %s", qr_context$reason),
+				call. = FALSE
+			)
 		}
 		if (print_progress) {
 			message(sprintf("Falling back to per-model lm fits: %s", qr_context$reason))
@@ -212,6 +226,12 @@ conductVibration <- function(base_formula, dataFrame, adjustby,
 			})
 			retFrame <- Filter(Negate(is.null), retFrame)
 			return(gatherFrames(retFrame))
+		}
+		if (is_multivariate_response_formula(base_formula)) {
+			stop(
+				sprintf("Multivariate gaussian VoE requires the QR backend: %s", qr_context$reason),
+				call. = FALSE
+			)
 		}
 		if (print_progress) {
 			message(sprintf("Falling back to per-model lm fits: %s", qr_context$reason))
@@ -368,42 +388,28 @@ conductVibrationSample <- function(base_formula, dataFrame, adjustby,
 
 #' Gather vibration results across k values
 #' @param returnFrames List of results from [conductVibrationForK()].
-#' @return A matrix of vibration results with a `k` column appended.
+#' @return A data frame of vibration results with a `k` column appended.
 #' @keywords internal
 gatherVibration <- function(returnFrames) {
-	nrows <- vapply(returnFrames, function(x) nrow(x$vibration), integer(1))
-
-	retFrame <- matrix(nrow = sum(nrows), ncol = ncol(returnFrames[[1]]$vibration) + 1)
-	colnames(retFrame) <- c(colnames(returnFrames[[1]]$vibration), "k")
-
-	startIndex <- 1
-	for (ii in seq_along(returnFrames)) {
-		ncols <- ncol(returnFrames[[ii]]$vibration)
-		retFrame[startIndex:(startIndex + nrows[ii] - 1), 1:ncols] <- returnFrames[[ii]]$vibration
-		retFrame[startIndex:(startIndex + nrows[ii] - 1), ncols + 1] <- returnFrames[[ii]]$k
-		startIndex <- startIndex + nrows[ii]
-	}
-	return(retFrame)
+	frames <- lapply(returnFrames, function(frame) {
+		df <- as.data.frame(frame$vibration, check.names = FALSE, stringsAsFactors = FALSE)
+		df$k <- frame$k
+		df
+	})
+	do.call(rbind, frames)
 }
 
 #' Gather BIC results across k values
 #' @param returnFrames List of results from [conductVibrationForK()].
-#' @return A matrix of BIC results with a `k` column appended.
+#' @return A data frame of BIC results with a `k` column appended.
 #' @keywords internal
 gatherVibrationBIC <- function(returnFrames) {
-	nrows <- vapply(returnFrames, function(x) nrow(x$bic), integer(1))
-
-	retFrame <- matrix(nrow = sum(nrows), ncol = ncol(returnFrames[[1]]$bic) + 1)
-	colnames(retFrame) <- c(colnames(returnFrames[[1]]$bic), "k")
-
-	startIndex <- 1
-	for (ii in seq_along(returnFrames)) {
-		ncols <- ncol(returnFrames[[ii]]$bic)
-		retFrame[startIndex:(startIndex + nrows[ii] - 1), 1:ncols] <- returnFrames[[ii]]$bic
-		retFrame[startIndex:(startIndex + nrows[ii] - 1), ncols + 1] <- returnFrames[[ii]]$k
-		startIndex <- startIndex + nrows[ii]
-	}
-	return(retFrame)
+	frames <- lapply(returnFrames, function(frame) {
+		df <- as.data.frame(frame$bic, check.names = FALSE, stringsAsFactors = FALSE)
+		df$k <- frame$k
+		df
+	})
+	do.call(rbind, frames)
 }
 
 #' Standardize column names for vibration output
@@ -442,7 +448,7 @@ gatherVibrationBIC <- function(returnFrames) {
 #' @return A data frame with standardized column names.
 #' @keywords internal
 harmonizeFrame <- function(vibFrame, family) {
-	vibFrame <- as.data.frame(vibFrame)
+	vibFrame <- as.data.frame(vibFrame, check.names = FALSE)
 	colnames(vibFrame) <- column_headers(vibFrame, family)
 	if (family %in% c("binomial")) {
 		vibFrame$HR <- exp(vibFrame$estimate)
