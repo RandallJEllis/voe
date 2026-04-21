@@ -235,8 +235,8 @@ apply_givens_rows <- function(M, j, cs, ss, col_start = 1L) {
 }
 
 apply_givens_cols <- function(Q, j, cs, ss) {
-	tmp <- cs * Q[, j] - ss * Q[, j + 1L]
-	Q[, j + 1L] <- ss * Q[, j] + cs * Q[, j + 1L]
+	tmp <- cs * Q[, j] + ss * Q[, j + 1L]
+	Q[, j + 1L] <- -ss * Q[, j] + cs * Q[, j + 1L]
 	Q[, j] <- tmp
 	Q
 }

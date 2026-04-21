@@ -25,6 +25,47 @@ test_that("gaussian QR backend matches classic lm fits for fixed k", {
 	expect_equal(fast$bic, classic$bic, tolerance = 1e-8)
 })
 
+test_that("gaussian QR backend stays aligned with classic fits for mixed adjustors at higher k", {
+	set.seed(11)
+	n <- 180
+	dat <- data.frame(
+		y = rnorm(n),
+		x = rnorm(n),
+		age = rnorm(n),
+		z_num1 = rnorm(n),
+		z_num2 = rnorm(n),
+		z_fac1 = factor(sample(letters[1:4], n, TRUE)),
+		z_fac2 = factor(sample(c("low", "mid", "high"), n, TRUE)),
+		z_bin1 = rbinom(n, 1, 0.4),
+		z_bin2 = rbinom(n, 1, 0.3)
+	)
+
+	dat$y <- 0.8 * dat$x - 0.4 * dat$age + 0.3 * dat$z_num1 - 0.2 * dat$z_num2 +
+		c(a = -0.2, b = 0.0, c = 0.25, d = 0.45)[as.character(dat$z_fac1)] +
+		c(low = -0.15, mid = 0.05, high = 0.3)[as.character(dat$z_fac2)] +
+		0.35 * dat$z_bin1 - 0.25 * dat$z_bin2 + rnorm(n, sd = 0.35)
+
+	classic <- voe:::conductVibrationForK_classic(
+		y ~ x + age,
+		dat,
+		~ z_num1 + z_num2 + z_fac1 + z_fac2 + z_bin1 + z_bin2,
+		k = 4,
+		family = "gaussian",
+		print_progress = FALSE
+	)
+	fast <- conductVibrationForK(
+		y ~ x + age,
+		dat,
+		~ z_num1 + z_num2 + z_fac1 + z_fac2 + z_bin1 + z_bin2,
+		k = 4,
+		family = "gaussian",
+		print_progress = FALSE
+	)
+
+	expect_equal(fast$vibration, classic$vibration, tolerance = 1e-8)
+	expect_equal(fast$bic, classic$bic, tolerance = 1e-8)
+})
+
 test_that("conductVibration includes the full adjustment model by default", {
 	set.seed(2)
 	dat <- data.frame(

@@ -28,6 +28,11 @@ The Python package exposes `voe.conduct_vibration()` and
 with the QR update/downdate machinery available in the bundled `regsens`
 core package.
 
+Reusable QR speedup benchmarks live in `benchmarks/` and
+`python/benchmarks/`. From the repo root, run
+`Rscript benchmarks/benchmark_voe_qr_speedup.R --dataset synthetic` or
+`python3 python/benchmarks/benchmark_voe_qr_speedup.py --dataset synthetic`.
+
 ## Example: Is serum cadmium associated with mortality?
 
 The association between serum cadmium and mortality depends heavily on which
